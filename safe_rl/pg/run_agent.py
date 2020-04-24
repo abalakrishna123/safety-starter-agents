@@ -7,13 +7,30 @@ from safe_rl.pg.agents import PPOAgent, TRPOAgent, CPOAgent
 from safe_rl.pg.buffer import CPOBuffer
 from safe_rl.pg.network import count_vars, \
                                get_vars, \
-                               mlp_actor_critic,\
+                               mlp_actor_critic, \
+                               mlp_squashed_gaussian_policy ,\
                                placeholders, \
                                placeholders_from_spaces
 from safe_rl.pg.utils import values_as_sorted_list
 from safe_rl.utils.logx import EpochLogger
 from safe_rl.utils.mpi_tf import MpiAdamOptimizer, sync_all_params
 from safe_rl.utils.mpi_tools import mpi_fork, proc_id, num_procs, mpi_sum
+
+try:
+    import safemrl.envs
+    from safemrl.envs import point_mass, minitaur
+    loaded_safemrl = True
+except ImportError:
+    loaded_safemrl = False
+    print("unable to import safemrl envs")
+
+try:
+    from recovery_rl.env import wrappers as rrl_wrappers
+    loaded_recovery_rl = True
+except ImportError:
+    loaded_recovery_rl = False
+    print("unable to import safemrl envs")
+
 
 # Multi-purpose agent runner for policy optimization algos 
 # (PPO, TRPO, their primal-dual equivalents, CPO)
@@ -496,6 +513,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--len', type=int, default=1000)
     parser.add_argument('--cost_lim', type=float, default=10)
+    parser.add_argument('--fall_cost', type=float, default=1)
     parser.add_argument('--exp_name', type=str, default='runagent')
     parser.add_argument('--kl', type=float, default=0.01)
     parser.add_argument('--render', action='store_true')
@@ -528,11 +546,29 @@ if __name__ == '__main__':
         agent = TRPOAgent(**agent_kwargs)
     elif args.agent=='cpo':
         agent = CPOAgent(**agent_kwargs)
+    
+    ac_kwargs = dict(hidden_sizes=[args.hid]*args.l)
+    env_str = args.env.split('-')[0]
+    if env_str == "DrunkSpiderPointMassEnv":
+        assert loaded_safemrl, "unable to load env: {}".format(args.env)
+        env_fn = lambda : point_mass.SafetyGymWrapper(gym.make(args.env),
+                                           fall_cost=args.fall_cost)
+    elif env_str == "MinitaurGoalVelocityEnv":
+        assert loaded_safemrl, "unable to load env: {}".format(args.env)
+        env_fn = lambda : minitaur.SafetyGymWrapper(gym.make(args.env),
+                                           fall_cost=args.fall_cost)
+        ac_kwargs['policy']  = mlp_squashed_gaussian_policy
+    elif env_str == "Maze":
+        env_fn = lambda : rrl_wrappers.SafetyGymWrapper(gym.make(args.env),
+                                                        fall_cost=args.fall_cost)
+        ac_kwargs['policy']  = mlp_squashed_gaussian_policy
+    else:
+        env_fn = lambda : gym.make(args.env)
 
-    run_polopt_agent(lambda : gym.make(args.env),
+    run_polopt_agent(env_fn,
                      agent=agent,
                      actor_critic=mlp_actor_critic,
-                     ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
+                     ac_kwargs=ac_kwargs, 
                      seed=args.seed, 
                      render=args.render, 
                      # Experience collection:
@@ -549,5 +585,5 @@ if __name__ == '__main__':
                      cost_lim=args.cost_lim, 
                      # Logging:
                      logger_kwargs=logger_kwargs,
-                     save_freq=1
+                     save_freq=10
                      )
