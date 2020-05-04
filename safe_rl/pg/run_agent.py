@@ -15,6 +15,8 @@ from safe_rl.pg.utils import values_as_sorted_list
 from safe_rl.utils.logx import EpochLogger
 from safe_rl.utils.mpi_tf import MpiAdamOptimizer, sync_all_params
 from safe_rl.utils.mpi_tools import mpi_fork, proc_id, num_procs, mpi_sum
+import pickle
+import os.path as osp
 
 try:
     import safemrl.envs
@@ -29,7 +31,7 @@ try:
     loaded_recovery_rl = True
 except ImportError:
     loaded_recovery_rl = False
-    print("unable to import safemrl envs")
+    print("unable to import recovery rl envs")
 
 
 # Multi-purpose agent runner for policy optimization algos 
@@ -53,6 +55,7 @@ def run_polopt_agent(env_fn,
                      ent_reg=0.,
                      # Cost constraints / penalties:
                      cost_lim=25,
+                     env_name='Shelf-v0',
                      penalty_init=1.,
                      penalty_lr=5e-2,
                      # KL divergence:
@@ -359,6 +362,8 @@ def run_polopt_agent(env_fn,
     o, r, d, c, ep_ret, ep_cost, ep_len = env.reset(), 0, False, 0, 0, 0, 0
     cur_penalty = 0
     cum_cost = 0
+    train_rollouts = []
+    train_rollouts.append([])
 
     for epoch in range(epochs):
 
@@ -382,6 +387,11 @@ def run_polopt_agent(env_fn,
 
             # Step in environment
             o2, r, d, info = env.step(a)
+            if env_name == 'Shelf-v0':
+                if (d or ep_len == max_ep_len-1)  and r > 0:
+                    r = 5
+                    info['reward'] = 5
+            train_rollouts[-1].append(info)
 
             # Include penalty on cost
             c = info.get('cost', 0)
@@ -427,6 +437,13 @@ def run_polopt_agent(env_fn,
 
                 # Reset environment
                 o, r, d, c, ep_ret, ep_len, ep_cost = env.reset(), 0, False, 0, 0, 0, 0
+                train_rollouts.append([])
+
+        data = {
+            "train_stats": train_rollouts
+        }
+        with open(osp.join(logger_kwargs['output_dir'], "run_stats.pkl"), "wb") as f:
+            pickle.dump(data, f)
 
         # Save model
         if (epoch % save_freq == 0) or (epoch == epochs-1):
@@ -508,7 +525,7 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--cost_gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--cpu', type=int, default=4)
+    parser.add_argument('--cpu', type=int, default=1)
     parser.add_argument('--steps', type=int, default=4000)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--len', type=int, default=1000)
@@ -548,23 +565,26 @@ if __name__ == '__main__':
         agent = CPOAgent(**agent_kwargs)
     
     ac_kwargs = dict(hidden_sizes=[args.hid]*args.l)
-    env_str = args.env.split('-')[0]
-    if env_str == "DrunkSpiderPointMassEnv":
+    env_str = args.env
+    if env_str == "DrunkSpiderPointMassEnv-v0":
         assert loaded_safemrl, "unable to load env: {}".format(args.env)
         env_fn = lambda : point_mass.SafetyGymWrapper(gym.make(args.env),
                                            fall_cost=args.fall_cost)
-    elif env_str == "MinitaurGoalVelocityEnv":
+    elif env_str == "MinitaurGoalVelocityEnv-v0":
         assert loaded_safemrl, "unable to load env: {}".format(args.env)
         env_fn = lambda : minitaur.SafetyGymWrapper(gym.make(args.env),
                                            fall_cost=args.fall_cost)
         ac_kwargs['policy']  = mlp_squashed_gaussian_policy
-    elif env_str == "Maze":
-        env_fn = lambda : rrl_wrappers.SafetyGymWrapper(gym.make(args.env),
+    elif env_str == "Maze-v0" or env_str == "SimplePointBot-v0" or env_str == "SimplePointBot-v1" or env_str == "Shelf-v0":
+        assert loaded_recovery_rl, "unable to load env: {}".format(args.env)
+        env = gym.make(args.env)
+        env_fn = lambda : rrl_wrappers.SafetyGymWrapper(env,
                                                         fall_cost=args.fall_cost)
         ac_kwargs['policy']  = mlp_squashed_gaussian_policy
     else:
         env_fn = lambda : gym.make(args.env)
 
+    max_ep_len = env._max_episode_steps
     run_polopt_agent(env_fn,
                      agent=agent,
                      actor_critic=mlp_actor_critic,
@@ -574,7 +594,7 @@ if __name__ == '__main__':
                      # Experience collection:
                      steps_per_epoch=args.steps, 
                      epochs=args.epochs,
-                     max_ep_len=args.len,
+                     max_ep_len=max_ep_len,
                      # Discount factors:
                      gamma=args.gamma,
                      cost_gamma=args.cost_gamma,
@@ -582,7 +602,8 @@ if __name__ == '__main__':
                      ent_reg=args.entreg,
                      # KL Divergence:
                      target_kl=args.kl,
-                     cost_lim=args.cost_lim, 
+                     cost_lim=args.cost_lim,
+                     env_name=env_str,
                      # Logging:
                      logger_kwargs=logger_kwargs,
                      save_freq=10

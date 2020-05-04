@@ -8,6 +8,23 @@ import time
 from safe_rl.utils.logx import EpochLogger
 from safe_rl.utils.mpi_tf import sync_all_params, MpiAdamOptimizer
 from safe_rl.utils.mpi_tools import mpi_fork, mpi_sum, proc_id, mpi_statistics_scalar, num_procs
+import pickle
+import os.path as osp
+
+try:
+    import safemrl.envs
+    from safemrl.envs import point_mass, minitaur
+    loaded_safemrl = True
+except ImportError:
+    loaded_safemrl = False
+    print("unable to import safemrl envs")
+
+try:
+    from recovery_rl.env import wrappers as rrl_wrappers
+    loaded_recovery_rl = True
+except ImportError:
+    loaded_recovery_rl = False
+    print("unable to import recovery rl envs")
 
 EPS = 1e-8
 
@@ -571,7 +588,7 @@ if __name__ == '__main__':
     parser.add_argument('--exp_name', type=str, default='sac')
     parser.add_argument('--steps_per_epoch', type=int, default=4000)
     parser.add_argument('--update_freq', type=int, default=100)
-    parser.add_argument('--cpu', type=int, default=4)
+    parser.add_argument('--cpu', type=int, default=1)
     parser.add_argument('--render', default=False, action='store_true')
     parser.add_argument('--local_start_steps', default=500, type=int)
     parser.add_argument('--local_update_after', default=500, type=int)
