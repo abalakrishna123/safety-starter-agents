@@ -10,7 +10,8 @@ from safe_rl.pg.network import count_vars, \
                                mlp_actor_critic, \
                                mlp_squashed_gaussian_policy ,\
                                placeholders, \
-                               placeholders_from_spaces
+                               placeholders_from_spaces, \
+                               placeholder_from_space
 from safe_rl.pg.utils import values_as_sorted_list
 from safe_rl.utils.logx import EpochLogger
 from safe_rl.utils.mpi_tf import MpiAdamOptimizer, sync_all_params
@@ -66,7 +67,10 @@ def run_polopt_agent(env_fn,
                      # Logging:
                      logger=None, 
                      logger_kwargs=dict(), 
-                     save_freq=1
+                     save_freq=1,
+                     demo_init=False,
+                     demo_path=None,
+                     task_demos=False
                      ):
 
 
@@ -94,6 +98,7 @@ def run_polopt_agent(env_fn,
 
     # Inputs to computation graph from environment spaces
     x_ph, a_ph = placeholders_from_spaces(env.observation_space, env.action_space)
+    a_star_ph = placeholder_from_space(env.action_space)
 
     # Inputs to computation graph for batch data
     adv_ph, cadv_ph, ret_ph, cret_ph, logp_old_ph = placeholders(*(None for _ in range(5)))
@@ -109,6 +114,14 @@ def run_polopt_agent(env_fn,
     # Organize placeholders for zipping with data from buffer on updates
     buf_phs = [x_ph, a_ph, adv_ph, cadv_ph, ret_ph, cret_ph, logp_old_ph]
     buf_phs += values_as_sorted_list(pi_info_phs)
+
+    # Same thing for constraint demos
+    constraint_demo_buf_phs = [x_ph, a_ph, adv_ph, cadv_ph, ret_ph, cret_ph, logp_old_ph]
+    constraint_demo_buf_phs += values_as_sorted_list(pi_info_phs)
+
+    # Similar thing for task demos
+    task_demo_buf_phs = [x_ph, a_ph, adv_ph, cadv_ph, ret_ph, cret_ph, logp_old_ph, a_star_ph]
+    task_demo_buf_phs += values_as_sorted_list(pi_info_phs)
 
     # Organize symbols we have to compute at each step of acting in env
     get_action_ops = dict(pi=pi, 
@@ -149,6 +162,23 @@ def run_polopt_agent(env_fn,
                     cost_gamma,
                     cost_lam)
 
+    constraint_demo_buf = CPOBuffer(max_ep_len,
+                                    obs_shape, 
+                                    act_shape, 
+                                    pi_info_shapes, 
+                                    gamma, 
+                                    lam,
+                                    cost_gamma,
+                                    cost_lam)
+
+    task_demo_buf = CPOBuffer(max_ep_len,
+                                    obs_shape, 
+                                    act_shape, 
+                                    pi_info_shapes, 
+                                    gamma, 
+                                    lam,
+                                    cost_gamma,
+                                    cost_lam)
 
     #=========================================================================#
     #  Create computation graph for penalty learning, if applicable           #
@@ -245,6 +275,12 @@ def run_polopt_agent(env_fn,
                                  d_kl=d_kl, 
                                  target_kl=target_kl,
                                  cost_lim=cost_lim))
+
+    # # If using behavior cloning, add in a BC loss too (**note that this requires data dist to come from demos not policy**)
+    if demo_init and task_demos:
+        pi_bc_loss = tf.reduce_mean((a_ph - a_star_ph)**2)
+        training_package.update(dict(pi_bc_loss=pi_bc_loss))
+
     agent.prepare_update(training_package)
 
     #=========================================================================#
@@ -255,6 +291,7 @@ def run_polopt_agent(env_fn,
     v_loss = tf.reduce_mean((ret_ph - v)**2)
     vc_loss = tf.reduce_mean((cret_ph - vc)**2)
 
+    # NOTE: moved this logic into update() function
     # If agent uses penalty directly in reward function, don't train a separate
     # value function for predicting cost returns. (Only use one vf for r - p*c.)
     if agent.reward_penalized:
@@ -263,7 +300,12 @@ def run_polopt_agent(env_fn,
         total_value_loss = v_loss + vc_loss
 
     # Optimizer for value learning
-    train_vf = MpiAdamOptimizer(learning_rate=vf_lr).minimize(total_value_loss)
+
+    # Since value function and constraint value function have independent
+    # parameters, we can seperate them out
+    train_vf = MpiAdamOptimizer(learning_rate=vf_lr).minimize(v_loss)
+    train_vf_c = MpiAdamOptimizer(learning_rate=vf_lr).minimize(vc_loss)
+    # train_vf = MpiAdamOptimizer(learning_rate=vf_lr).minimize(total_value_loss)
 
 
     #=========================================================================#
@@ -290,7 +332,8 @@ def run_polopt_agent(env_fn,
     #  Create function for running update (called at end of each epoch)       #
     #=========================================================================#
 
-    def update():
+    def update(constraint_demo_phase=False, task_demo_phase=False):
+        demo_phase = constraint_demo_phase or task_demo_phase
         cur_cost = logger.get_stats('EpCost')[0]
         c = cur_cost - cost_lim
         if c > 0 and agent.cares_about_cost:
@@ -299,8 +342,15 @@ def run_polopt_agent(env_fn,
         #=====================================================================#
         #  Prepare feed dict                                                  #
         #=====================================================================#
+        if not demo_phase:
+            inputs = {k:v for k,v in zip(buf_phs, buf.get())}
+        elif constraint_demo_phase:
+            inputs = {k:v for k,v in zip(constraint_demo_buf_phs, constraint_demo_buf.get())}
+        elif task_demo_phase:
+            inputs = {k:v for k,v in zip(task_demo_buf_phs, task_demo_buf.get())}
+        else:
+            assert(False)
 
-        inputs = {k:v for k,v in zip(buf_phs, buf.get())}
         inputs[surr_cost_rescale_ph] = logger.get_stats('EpLen')[0]
         inputs[cur_cost_ph] = cur_cost
 
@@ -308,48 +358,67 @@ def run_polopt_agent(env_fn,
         #  Make some measurements before updating                             #
         #=====================================================================#
 
-        measures = dict(LossPi=pi_loss,
-                        SurrCost=surr_cost,
-                        LossV=v_loss,
-                        Entropy=ent)
-        if not(agent.reward_penalized):
-            measures['LossVC'] = vc_loss
-        if agent.use_penalty:
-            measures['Penalty'] = penalty
+        if not demo_phase:
+            measures = dict(LossPi=pi_loss,
+                            SurrCost=surr_cost,
+                            LossV=v_loss,
+                            Entropy=ent)
+            if not(agent.reward_penalized):
+                measures['LossVC'] = vc_loss
+            if agent.use_penalty:
+                measures['Penalty'] = penalty
 
-        pre_update_measures = sess.run(measures, feed_dict=inputs)
-        logger.store(**pre_update_measures)
+            pre_update_measures = sess.run(measures, feed_dict=inputs)
+            logger.store(**pre_update_measures)
 
         #=====================================================================#
         #  Update penalty if learning penalty                                 #
         #=====================================================================#
-        if agent.learn_penalty:
-            sess.run(train_penalty, feed_dict={cur_cost_ph: cur_cost})
+        if not demo_phase:
+            if agent.learn_penalty:
+                sess.run(train_penalty, feed_dict={cur_cost_ph: cur_cost})
 
         #=====================================================================#
         #  Update policy                                                      #
         #=====================================================================#
-        agent.update_pi(inputs)
+        ### Only update policy if not in constraint demo phase
+        if not demo_phase:
+            agent.update_pi(inputs)
+        elif task_demo_phase:
+            agent.update_pi(inputs, bc_loss=True)
 
         #=====================================================================#
         #  Update value function                                              #
         #=====================================================================#
-        for _ in range(vf_iters):
-            sess.run(train_vf, feed_dict=inputs)
+
+        if not demo_phase:
+            # If agent uses penalty directly in reward function, don't train a separate
+            # value function for predicting cost returns. (Only use one vf for r - p*c.)
+            if agent.reward_penalized:
+                for _ in range(vf_iters):
+                    sess.run(train_vf, feed_dict=inputs)
+            else:
+                for _ in range(vf_iters):
+                    sess.run(train_vf, feed_dict=inputs)
+                    sess.run(train_vf_c, feed_dict=inputs)
+        elif constraint_demo_phase:
+        # Only train the constraint value function
+            for _ in range(vf_iters):
+                sess.run(train_vf_c, feed_dict=inputs)
 
         #=====================================================================#
         #  Make some measurements after updating                              #
         #=====================================================================#
+        if not demo_phase:
+            del measures['Entropy']
+            measures['KL'] = d_kl
 
-        del measures['Entropy']
-        measures['KL'] = d_kl
-
-        post_update_measures = sess.run(measures, feed_dict=inputs)
-        deltas = dict()
-        for k in post_update_measures:
-            if k in pre_update_measures:
-                deltas['Delta'+k] = post_update_measures[k] - pre_update_measures[k]
-        logger.store(KL=post_update_measures['KL'], **deltas)
+            post_update_measures = sess.run(measures, feed_dict=inputs)
+            deltas = dict()
+            for k in post_update_measures:
+                if k in pre_update_measures:
+                    deltas['Delta'+k] = post_update_measures[k] - pre_update_measures[k]
+            logger.store(KL=post_update_measures['KL'], **deltas)
 
 
 
@@ -359,11 +428,124 @@ def run_polopt_agent(env_fn,
     #=========================================================================#
 
     start_time = time.time()
+    # Initialize from demos: First train constraint value function (ONLY)
+    if demo_init:
+        # Update using constraint demos
+        constraint_demo_data = pickle.load(open(osp.join(demo_path, "constraint_demo_rollouts.pkl"), "rb"))
+        num_demo_train_iters = 100
+        for i in range(num_demo_train_iters):
+            print("Demo Training Iter: ", i)
+
+            iter_steps = 0
+            iter_done = False
+            while True:
+                ep_cost = 0
+                ep_len = 0
+                # Sample an episode from constraint_demo_data at random
+                rollout = constraint_demo_data[np.random.randint(len(constraint_demo_data))]
+
+                for transition in rollout:
+                    o, a, c, o2, d = transition
+                    print("transition", transition)
+                    get_action_outs = sess.run(get_action_ops, 
+                                       feed_dict={x_ph: o[np.newaxis]})
+                    a_pi = get_action_outs['pi']
+                    v_t = get_action_outs['v']
+                    vc_t = get_action_outs.get('vc', 0)  # Agent may not use cost value func
+                    logp_t = get_action_outs['logp_pi']
+                    pi_info_t = get_action_outs['pi_info']
+                    if iter_steps == max_ep_len:
+                        print(iter_steps)
+                        iter_done = True
+                        break
+                    constraint_demo_buf.store(o, a, 0, v_t, c, vc_t, logp_t, pi_info_t)
+                    ep_cost += c
+                    ep_len += 1
+                    iter_steps += 1
+
+                last_val, last_cval = 0, 0
+                constraint_demo_buf.finish_path(last_val, last_cval)
+                # Note that EpRet doesn't matter here because we are only updating cost value function
+                logger.store(EpRet=0, EpLen=ep_len, EpCost=ep_cost) 
+                if iter_done:
+                    break
+
+            # Now we have finished max_ep_len steps so we can update!
+            update(constraint_demo_phase=True)
+            print("Update: ", i)
+
+            logger.log_tabular('Epoch', i)
+
+            # Performance stats
+            logger.log_tabular('EpRet', with_min_and_max=True)
+            logger.log_tabular('EpCost', with_min_and_max=True)
+            logger.log_tabular('EpLen', average_only=True)
+            # Show results!
+            logger.dump_tabular()
+
+        # Update policy via behavior cloning: Note here we are *only* updating the policy
+        if task_demos:
+            logger.first_row = True # Hot fix to reset log
+            task_demo_data = pickle.load(open(osp.join(demo_path, "task_demo_rollouts.pkl"), "rb"))
+
+            num_demo_train_iters = 100
+            for i in range(num_demo_train_iters):
+                print("Task Demo Training Iter: ", i)
+
+                iter_steps = 0
+                iter_done = False
+                while True:
+                    ep_cost = 0
+                    ep_len = 0
+                    ep_ret = 0
+                    # Sample an episode from constraint_demo_data at random
+                    rollout = task_demo_data[np.random.randint(len(task_demo_data))]
+
+                    for transition in rollout:
+                        o, a, r, o2, d = transition
+                        print("transition", transition)
+                        get_action_outs = sess.run(get_action_ops, 
+                                           feed_dict={x_ph: o[np.newaxis]})
+                        a_pi = get_action_outs['pi']
+                        v_t = get_action_outs['v']
+                        vc_t = get_action_outs.get('vc', 0)  # Agent may not use cost value func
+                        logp_t = get_action_outs['logp_pi']
+                        pi_info_t = get_action_outs['pi_info']
+                        if iter_steps == max_ep_len:
+                            print(iter_steps)
+                            iter_done = True
+                            break
+                        task_demo_buf.store(o, a_pi, r, v_t, 0, 0, logp_t, pi_info_t, a)
+                        ep_ret += r
+                        ep_len += 1
+                        iter_steps += 1
+
+                    last_val, last_cval = 0, 0
+                    task_demo_buf.finish_path(last_val, last_cval)
+                    # Note that EpCost doesn't matter here because we are only updating policy
+                    logger.store(EpRet=ep_ret, EpLen=ep_len, EpCost=0) 
+                    if iter_done:
+                        break
+
+                # Now we have finished max_ep_len steps so we can update!
+                update(task_demo_phase=True)
+                print("Update: ", i)
+
+                logger.log_tabular('Epoch', i)
+
+                # Performance stats
+                logger.log_tabular('EpRet', with_min_and_max=True)
+                logger.log_tabular('EpCost', with_min_and_max=True)
+                logger.log_tabular('EpLen', average_only=True)
+                # Show results!
+                logger.dump_tabular()
+
     o, r, d, c, ep_ret, ep_cost, ep_len = env.reset(), 0, False, 0, 0, 0, 0
     cur_penalty = 0
     cum_cost = 0
     train_rollouts = []
     train_rollouts.append([])
+    logger.first_row = True # Hot fix to reset log
 
     for epoch in range(epochs):
 
@@ -539,8 +721,23 @@ if __name__ == '__main__':
     parser.add_argument('--learn_penalty', action='store_true')
     parser.add_argument('--penalty_param_loss', action='store_true')
     parser.add_argument('--entreg', type=float, default=0.)
+    parser.add_argument('--demo_init', action='store_true')
+    parser.add_argument('--task_demos', action='store_true')
     args = parser.parse_args()
 
+    demo_path = None
+    if args.demo_init:
+        base_dir = '/data/recovery-rl/demos/'
+        if args.env == 'SimplePointBot-v0':
+            demo_path = osp.join(base_dir, 'simplepointbot0')
+        elif args.env == 'SimplePointBot-v1':
+            demo_path = osp.join(base_dir, 'simplepointbot1')
+        elif args.env == 'Maze-v0':
+            demo_path = osp.join(base_dir, 'maze')
+        elif args.env == 'Shelf-v0':
+            demo_path = osp.join(base_dir, 'shelf')
+        else:
+            raise NotImplementedError("No demos for this env")
     try:
         import safety_gym
     except:
@@ -606,5 +803,8 @@ if __name__ == '__main__':
                      env_name=env_str,
                      # Logging:
                      logger_kwargs=logger_kwargs,
-                     save_freq=10
+                     save_freq=10,
+                     demo_init=args.demo_init, 
+                     demo_path=demo_path,
+                     task_demos=args.task_demos
                      )

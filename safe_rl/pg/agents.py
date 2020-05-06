@@ -219,15 +219,14 @@ class CPOAgent(TrustRegionAgent):
         self.margin_lr = 0.05
 
 
-    def update_pi(self, inputs):
-
+    def update_pi(self, inputs, bc_loss=False):
         flat_g = self.training_package['flat_g']
         flat_b = self.training_package['flat_b']
         v_ph = self.training_package['v_ph']
         hvp = self.training_package['hvp']
         get_pi_params = self.training_package['get_pi_params']
         set_pi_params = self.training_package['set_pi_params']
-        pi_loss = self.training_package['pi_loss']
+        pi_loss = self.training_package['pi_loss'] if not bc_loss else self.training_package['pi_bc_loss']
         surr_cost = self.training_package['surr_cost']
         d_kl = self.training_package['d_kl']
         target_kl = self.training_package['target_kl']
